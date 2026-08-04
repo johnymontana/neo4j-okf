@@ -1,0 +1,20 @@
+services:
+  neo4j:
+    image: neo4j:2025.06-community
+    container_name: okf-neo4j
+    ports:
+      - "7474:7474"   # browser
+      - "7687:7687"   # bolt
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-demodemo}
+      NEO4J_server_memory_heap_max__size: 2G
+    volumes:
+      - okf_neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-demodemo}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  okf_neo4j_data:

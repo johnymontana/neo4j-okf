@@ -1,0 +1,36 @@
+[project]
+name = "okf-graph"
+version = "0.2.0"
+description = "Ingest Google's Open Knowledge Format (OKF) bundles into Neo4j and query them with GraphRAG"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "neo4j>=5.28",
+    "neo4j-graphrag[openai]>=1.18",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    # demo notebook
+    "pandas>=2.0",
+    "neo4j-viz>=1.7",
+    "jupyterlab>=4.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "nbconvert>=7.16",
+    "ipykernel>=6.29",
+]
+
+[project.scripts]
+okf-graph = "okf_graph.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["okf_graph"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
