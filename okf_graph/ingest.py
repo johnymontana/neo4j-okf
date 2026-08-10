@@ -23,6 +23,7 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Optional
 
@@ -54,6 +55,13 @@ def get_driver(uri: Optional[str] = None, user: Optional[str] = None,
         uri or os.getenv("NEO4J_URI", "bolt://localhost:7687"),
         auth=(user or os.getenv("NEO4J_USERNAME", "neo4j"),
               password or os.getenv("NEO4J_PASSWORD", "password")),
+        # Every OKF frontmatter family is optional (SPEC §5), so a query over a
+        # bundle that never used `runtime` or `computation` earns a stream of
+        # "property key does not exist" notifications. Expected here, and the
+        # noise buries real output — so only UNRECOGNIZED is muted; performance
+        # and deprecation notifications still come through.
+        notifications_disabled_classifications=[
+            neo4j.NotificationDisabledClassification.UNRECOGNIZED],
     )
 
 
@@ -145,8 +153,15 @@ class GraphWriter:
     def _write_bundle(self, pb: ParsedBundle) -> None:
         self.run(
             """MERGE (b:Bundle {name: $name})
-               SET b.okf_version = $version, b.root = $root""",
-            name=pb.name, version=pb.okf_version, root=pb.root,
+               SET b.okf_version = $version, b.root = $root,
+                   b.log_frontmatter = $log_frontmatter""",
+            name=pb.name, version=pb.okf_version,
+            # basename only: the absolute ingest path is machine-local state,
+            # not bundle content, and a shared graph should not carry it
+            root=os.path.basename(pb.root.rstrip("/")) if pb.root else "",
+            # §9 defines no frontmatter for log.md but the reference bundle
+            # ships some; kept verbatim so a projection reproduces it exactly
+            log_frontmatter=json.dumps(pb.log_frontmatter) if pb.log_frontmatter else None,
         )
 
     def _write_concepts(self, pb: ParsedBundle) -> None:
@@ -163,6 +178,11 @@ class GraphWriter:
                 "runtime": c.runtime, "parameters_json": c.parameters_json,
                 "receipt": c.receipt or None, "stub": c.stub,
                 "type_label": c.type_label,
+                # authored path strings, kept so the bundle can be re-emitted
+                # from the graph alone (emit.py) instead of guessed at
+                "executor_raw": c.executor_raw,
+                "attester_raw": c.attester_raw,
+                "computation_raw": c.computation_raw,
             })
         self.run(
             """UNWIND $rows AS row
@@ -179,7 +199,10 @@ class GraphWriter:
                    c.extra_frontmatter = row.extra, c.body = row.body,
                    c.runtime = row.runtime, c.parameters_json = row.parameters_json,
                    c.receipt = row.receipt, c.stub = row.stub,
-                   c.type_label = row.type_label
+                   c.type_label = row.type_label,
+                   c.executor_raw = row.executor_raw,
+                   c.attester_raw = row.attester_raw,
+                   c.computation_raw = row.computation_raw
                WITH c, row
                MATCH (b:Bundle {name: row.bundle})
                MERGE (c)-[:IN_BUNDLE]->(b)""",
@@ -238,14 +261,15 @@ class GraphWriter:
             rows=gen_rows,
         )
         ver_rows = [
-            {"uid": c.uid, "actor": actor.id, "at": at}
-            for c in pb.concepts.values() for actor, at in c.verified
+            {"uid": c.uid, "actor": actor.id, "at": at, "order": i}
+            for c in pb.concepts.values() for i, (actor, at) in enumerate(c.verified)
         ]
         self.run(
             """UNWIND $rows AS row
                MATCH (c:Concept {uid: row.uid}), (a:Actor {id: row.actor})
                CREATE (c)-[v:VERIFIED_BY]->(a)
-               SET v.at = CASE WHEN row.at IS NULL THEN NULL ELSE datetime(row.at) END""",
+               SET v.order = row.order,
+                   v.at = CASE WHEN row.at IS NULL THEN NULL ELSE datetime(row.at) END""",
             rows=ver_rows,
         )
 
@@ -261,8 +285,14 @@ class GraphWriter:
                 })
                 edge_rows.append({
                     "concept": c.uid, "source": s.uid, "sid": s.sid,
-                    "usage_count": s.usage_count,
+                    "usage_count": s.usage_count, "order": s.order,
                     "wfrom": s.usage_window_from, "wto": s.usage_window_to,
+                    # Source nodes are deduped by resource, so two concepts
+                    # citing the same document share one node and the last
+                    # writer wins. These three are declared *per citation*, so
+                    # the edge is where the authored value actually lives.
+                    "title": s.title, "author": s.author,
+                    "last_modified": s.last_modified,
                 })
                 if s.resolves_to_concept:
                     resolve_rows.append({"source": s.uid, "target": s.resolves_to_concept})
@@ -285,7 +315,10 @@ class GraphWriter:
             """UNWIND $rows AS row
                MATCH (c:Concept {uid: row.concept}), (s:Source {uid: row.source})
                CREATE (c)-[d:DERIVES_FROM]->(s)
-               SET d.sid = row.sid, d.usage_count = row.usage_count,
+               SET d.sid = row.sid, d.usage_count = row.usage_count, d.order = row.order,
+                   d.title = row.title, d.author = row.author,
+                   d.last_modified = CASE WHEN row.last_modified IS NULL THEN NULL
+                                          ELSE date(row.last_modified) END,
                    d.usage_window_from = CASE WHEN row.wfrom IS NULL THEN NULL ELSE date(row.wfrom) END,
                    d.usage_window_to   = CASE WHEN row.wto   IS NULL THEN NULL ELSE date(row.wto)   END""",
             rows=edge_rows,
@@ -379,8 +412,10 @@ class GraphWriter:
         self.run(
             """UNWIND $rows AS row
                MERGE (a:Artifact {uid: row.uid})
-               SET a.path = row.path, a.kind = row.kind, a.bundle = row.bundle""",
-            rows=[{**a, "bundle": pb.name} for a in pb.artifacts.values()],
+               SET a.path = row.path, a.kind = row.kind, a.bundle = row.bundle,
+                   a.text = row.text, a.sha256 = row.sha256""",
+            rows=[{"text": None, "sha256": None, **a, "bundle": pb.name}
+                  for a in pb.artifacts.values()],
         )
         exec_rows, attest_rows, comp_rows = [], [], []
         for c in pb.concepts.values():
@@ -421,12 +456,13 @@ class GraphWriter:
         rows = [{
             "uid": e.uid, "date": e.date, "kind": e.kind, "text": e.text,
             "order": e.order, "bundle": pb.name, "refs": e.references,
+            "dir": e.dir,
         } for e in pb.log_entries if e.date]
         self.run(
             """UNWIND $rows AS row
                MERGE (l:LogEntry {uid: row.uid})
                SET l.date = date(row.date), l.kind = row.kind, l.text = row.text,
-                   l.order = row.order, l.bundle = row.bundle
+                   l.order = row.order, l.bundle = row.bundle, l.dir = row.dir
                WITH l, row
                MATCH (b:Bundle {name: row.bundle})
                MERGE (l)-[:IN_BUNDLE]->(b)

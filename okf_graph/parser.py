@@ -32,6 +32,7 @@ Mapping produced here (see ingest.py for the Cypher side):
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -60,6 +61,11 @@ LOG_KIND_RE = re.compile(r"^\*\*([^*]+)\*\*[:\s]*")
 
 MAX_SECTION_CHARS = 2400  # long sections are split at paragraph boundaries
 
+# Bundles carry code alongside concepts (attesters, computation files). We keep
+# the text of small ones in the model so a bundle can be re-emitted from the
+# graph alone (see emit.py); anything larger or non-UTF-8 stays a path.
+MAX_ARTIFACT_BYTES = 64 * 1024
+
 
 # --------------------------------------------------------------------------
 # In-memory model
@@ -84,6 +90,7 @@ class ParsedSource:
     usage_count: Optional[int] = None
     last_modified: Optional[str] = None       # YYYY-MM-DD
     is_scope: bool = False                    # scope descriptor, not a path
+    order: int = 0                            # position in the concept's sources[]
     resolves_to_concept: Optional[str] = None # concept uid if internal .md
     resolves_to_artifact: Optional[str] = None
     # declaration-scoped (edge) properties
@@ -111,6 +118,11 @@ class ParsedSection:
     text: str
     cites: list[str] = field(default_factory=list)      # Source uids
     mentions: list[str] = field(default_factory=list)   # Concept uids
+    # An over-long section is split across several nodes; `part` records which
+    # piece this is (1 when the section was not split). Kept as data rather
+    # than encoded in `heading`, so an authored "Notes (part 2)" is never
+    # mistaken for a synthetic split when the body is reassembled.
+    part: int = 1
 
 
 @dataclass
@@ -121,6 +133,7 @@ class ParsedLogEntry:
     text: str
     order: int
     references: list[str] = field(default_factory=list)  # concept uids
+    dir: str = ""            # which log.md it came from (SPEC §9 allows any level)
 
 
 @dataclass
@@ -153,7 +166,17 @@ class ParsedConcept:
     executor_resource: Optional[str] = None
     attester_resource: Optional[str] = None
     computation_path: Optional[str] = None
+    # the path strings exactly as authored — the three fields above get
+    # normalized to uids during link extraction, and emit.py needs the originals
+    executor_raw: Optional[str] = None
+    attester_raw: Optional[str] = None
+    computation_raw: Optional[str] = None
     stub: bool = False
+    # False when the file's YAML would not parse. The frontmatter families are
+    # then all defaults, and a re-emit would stack a second block on top of the
+    # unparsed original — so emit.py refuses instead, and the projection
+    # manifest names the file.
+    frontmatter_ok: bool = True
 
 
 @dataclass
@@ -167,6 +190,10 @@ class ParsedBundle:
     actors: dict[str, ParsedActor] = field(default_factory=dict)
     artifacts: dict[str, dict] = field(default_factory=dict)          # uid -> {path, kind}
     log_entries: list[ParsedLogEntry] = field(default_factory=list)
+    log_frontmatter: dict[str, str] = field(default_factory=dict)     # dir -> raw YAML
+    # Things a strictly-conformant consumer must tolerate but a *producer*
+    # wants to know about (SPEC §11 tolerate-don't-reject cuts both ways).
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def all_sections(self) -> list[ParsedSection]:
@@ -211,20 +238,33 @@ def parse_actor(raw: Any) -> Optional[ParsedActor]:
                        version=version or None)
 
 
-def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+def split_frontmatter_ex(text: str) -> tuple[dict[str, Any], str, bool]:
+    """`(frontmatter, body, ok)`.
+
+    `ok` is False when a `---` block is present but unusable (bad YAML,
+    unterminated, or not a mapping). Parsing still succeeds with defaults, per
+    the tolerate-don't-reject posture (§11) — but callers that re-serialize the
+    concept need to know, or they will write a second frontmatter block on top
+    of the unparsed original.
+    """
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        return {}, text
+        return {}, text, True                  # no frontmatter at all is not a failure
     for i in range(1, len(lines)):
         if lines[i].strip() == "---":
             try:
                 fm = yaml.safe_load("\n".join(lines[1:i])) or {}
             except yaml.YAMLError:
-                return {}, text  # tolerate, per conformance rules
+                return {}, text, False         # tolerate, per conformance rules
             if not isinstance(fm, dict):
-                fm = {}
-            return fm, "\n".join(lines[i + 1:]).lstrip("\n")
-    return {}, text
+                return {}, text, False
+            return fm, "\n".join(lines[i + 1:]).lstrip("\n"), True
+    return {}, text, False                     # opened but never closed
+
+
+def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    fm, body, _ = split_frontmatter_ex(text)
+    return fm, body
 
 
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
@@ -253,8 +293,8 @@ def _iter_nonfence_lines(body: str) -> Iterable[tuple[int, str, bool]]:
         yield i, line, open_marker is not None
 
 
-def split_sections(body: str) -> list[tuple[str, str]]:
-    """Split a body into (heading, text) on h1 headings, fence-aware.
+def split_sections(body: str) -> list[tuple[str, str, int]]:
+    """Split a body into (heading, text, part) on h1 headings, fence-aware.
 
     OKF bodies conventionally use `# Schema`, `# Computation`, ... (SPEC §4.2),
     which gives us semantically meaningful retrieval units without arbitrary
@@ -274,26 +314,25 @@ def split_sections(body: str) -> list[tuple[str, str]]:
     if current_lines and any(l.strip() for l in current_lines):
         sections.append((current_heading, current_lines))
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, int]] = []
     for heading, lines in sections:
         text = "\n".join(lines).strip()
         if not text:
             continue
         if len(text) <= MAX_SECTION_CHARS:
-            out.append((heading, text))
+            out.append((heading, text, 1))
         else:  # split long sections at paragraph boundaries
             paras, buf, size = text.split("\n\n"), [], 0
             part = 1
             for p in paras:
                 if buf and size + len(p) > MAX_SECTION_CHARS:
-                    out.append((f"{heading} (part {part})", "\n\n".join(buf)))
+                    out.append((heading, "\n\n".join(buf), part))
                     part += 1
                     buf, size = [], 0
                 buf.append(p)
                 size += len(p) + 2
             if buf:
-                suffix = f" (part {part})" if part > 1 else ""
-                out.append((heading + suffix, "\n\n".join(buf)))
+                out.append((heading, "\n\n".join(buf), part))
     return out
 
 
@@ -371,6 +410,17 @@ class BundleParser:
 
         # pass 3: log files
         self._parse_logs(pb)
+        # pass 4: every remaining non-markdown file. Bundles ship code and
+        # assets alongside concepts; registering only the *referenced* ones
+        # meant an unreferenced file (acme's own viz.html) silently vanished
+        # from any projection.
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() == ".md":
+                continue
+            rel = path.relative_to(self.root)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            self._register_artifact(pb, rel.as_posix())
         return pb
 
     def _read_okf_version(self) -> Optional[str]:
@@ -387,10 +437,15 @@ class BundleParser:
         rel = path.relative_to(self.root).as_posix()
         cid = rel[:-3]
         uid = f"{self.bundle}:{cid}"
-        fm, body = split_frontmatter(path.read_text(encoding="utf-8-sig"))
+        fm, body, fm_ok = split_frontmatter_ex(path.read_text(encoding="utf-8-sig"))
+        if not fm_ok:
+            pb.warnings.append(
+                f"{rel}: frontmatter present but unparseable — defaults applied, "
+                "and this file will not be re-serialized")
 
-        ctype = str(fm.get("type") or "Concept")
-        title = str(fm.get("title") or Path(cid).name.replace("-", " ").replace("_", " ").title())
+        ctype = _scalar(fm.get("type")) or "Concept"
+        title = (_scalar(fm.get("title"))
+                 or Path(cid).name.replace("-", " ").replace("_", " ").title())
 
         concept = ParsedConcept(
             uid=uid, id=cid, bundle=self.bundle, path=rel,
@@ -398,10 +453,11 @@ class BundleParser:
             type=ctype, type_label=type_to_label(ctype), title=title,
             description=_scalar(fm.get("description")),
             resource=_scalar(fm.get("resource")),
-            status=str(fm.get("status") or "stable"),
+            status=_scalar(fm.get("status")) or "stable",
             stale_after=_date_str(fm.get("stale_after")),
             tags=_tags_list(fm.get("tags")),
             body=body,
+            frontmatter_ok=fm_ok,
         )
 
         # trust family (SPEC §5.2) with v0.1 `timestamp` fallback (§13.1)
@@ -432,6 +488,13 @@ class BundleParser:
         shared_window = fm.get("usage_window") or {}
         for i, entry in enumerate(fm.get("sources") or []):
             if not isinstance(entry, dict) or not entry.get("resource"):
+                # §5.1 requires `resource`; without it there is nothing to
+                # dedupe or resolve on, so the entry is dropped — but any
+                # `[^id]` footnote keyed to it then silently cites nothing.
+                sid = entry.get("id") if isinstance(entry, dict) else None
+                pb.warnings.append(
+                    f"{rel}: sources[{i}] has no `resource` and was dropped"
+                    + (f" — footnotes keyed [^{sid}] will not cite" if sid else ""))
                 continue
             concept.sources.append(self._parse_source(concept, i, entry, shared_window))
 
@@ -444,14 +507,25 @@ class BundleParser:
         if isinstance(executor, dict):
             res = executor.get("resource")
             concept.executor_resource = res if isinstance(res, str) else None
+            concept.executor_raw = concept.executor_resource
             receipt = executor.get("receipt")
             concept.receipt = [str(r) for r in receipt] if isinstance(receipt, list) else []
         attester = fm.get("attester") or {}
         if isinstance(attester, dict):
             res = attester.get("resource")
             concept.attester_resource = res if isinstance(res, str) else None
+            concept.attester_raw = concept.attester_resource
         if isinstance(fm.get("computation"), str):
             concept.computation_path = fm["computation"]
+            concept.computation_raw = fm["computation"]
+
+        if _has_unclosed_fence(body):
+            # everything after the dangling ``` is invisible to sectioning and
+            # link extraction; Concept.body still holds it, so a projection is
+            # safe, but the graph is missing sections the author wrote
+            pb.warnings.append(
+                f"{rel}: unclosed code fence — sections and links after it were "
+                "not extracted")
 
         # preserve unknown keys (conformance: MUST NOT reject; SHOULD round-trip)
         extra = {str(k): v for k, v in fm.items() if str(k) not in KNOWN_KEYS}
@@ -460,15 +534,18 @@ class BundleParser:
 
         # sections (lexical layer)
         source_by_sid = {s.sid: s.uid for s in concept.sources if s.sid}
-        for order, (heading, text) in enumerate(split_sections(body)):
+        for order, (heading, text, part) in enumerate(split_sections(body)):
             sec = ParsedSection(
                 uid=f"{uid}#s{order}", concept_uid=uid,
-                heading=heading, order=order, text=text,
+                heading=heading, order=order, text=text, part=part,
             )
-            # count only *references* — drop definition lines ([^id]: …) so a
-            # section holding just the footnote text doesn't claim a citation
+            # Count only *references*, and only outside code: drop definition
+            # lines ([^id]: …) so a section holding just the footnote text
+            # doesn't claim a citation, and strip fences so a regex like
+            # `[^A-Z]` inside a SQL block can't mint claim-level provenance.
             non_def_text = "\n".join(
-                ln for ln in text.splitlines() if not FOOTNOTE_DEF_RE.match(ln)
+                ln for ln in _strip_fences(text).splitlines()
+                if not FOOTNOTE_DEF_RE.match(ln)
             )
             refs = FOOTNOTE_REF_RE.findall(non_def_text)
             sec.cites = sorted({source_by_sid[r] for r in refs if r in source_by_sid})
@@ -490,6 +567,7 @@ class BundleParser:
             usage_count=entry.get("usage_count"),
             last_modified=_date_str(entry.get("last_modified")),
             is_scope=is_scope,
+            order=i,
         )
         window = entry.get("usage_window") or shared_window
         if isinstance(window, dict):
@@ -553,22 +631,49 @@ class BundleParser:
                 if kind == "executor":
                     concept.executor_resource = target_uid       # normalized to uid
             else:
-                art_uid = f"{self.bundle}:art:{rel}"
-                pb.artifacts.setdefault(art_uid, {
-                    "uid": art_uid, "path": rel,
-                    "kind": "code" if rel.endswith((".py", ".sql", ".js")) else "file",
-                })
+                art_uid = self._register_artifact(pb, rel)
                 if kind == "attester":
                     concept.attester_resource = art_uid
                 elif kind == "computation":
                     concept.computation_path = art_uid
         for src in concept.sources:
             if src.resolves_to_artifact:
-                rel = src.resolves_to_artifact.split(":art:", 1)[1]
-                pb.artifacts.setdefault(src.resolves_to_artifact, {
-                    "uid": src.resolves_to_artifact, "path": rel,
-                    "kind": "code" if rel.endswith((".py", ".sql", ".js")) else "file",
-                })
+                self._register_artifact(
+                    pb, src.resolves_to_artifact.split(":art:", 1)[1])
+
+    def _register_artifact(self, pb: ParsedBundle, rel: str) -> str:
+        """Record a non-.md bundle file, carrying its text when small enough.
+
+        Size is checked from the directory entry before anything is read: a
+        `sources[].resource` is free-form producer input, so pointing it at a
+        multi-gigabyte file must not turn a parse into a full read.
+        """
+        art_uid = f"{self.bundle}:art:{rel}"
+        if art_uid in pb.artifacts:
+            return art_uid
+        path = self.root / rel
+        text: Optional[str] = None
+        digest: Optional[str] = None
+        size: Optional[int] = None
+        reason: Optional[str] = None
+        try:
+            size = path.stat().st_size
+            digest = _sha256_file(path)
+            if size > MAX_ARTIFACT_BYTES:
+                reason = "too_big"
+            else:
+                try:
+                    text = path.read_bytes().decode("utf-8")
+                except UnicodeDecodeError:
+                    reason = "binary"
+        except OSError:
+            reason = "missing"
+        pb.artifacts[art_uid] = {
+            "uid": art_uid, "path": rel,
+            "kind": "code" if rel.endswith((".py", ".sql", ".js")) else "file",
+            "text": text, "sha256": digest, "size": size, "reason": reason,
+        }
+        return art_uid
 
     # ---- log parsing -----------------------------------------------------------
 
@@ -577,7 +682,13 @@ class BundleParser:
         for log_path in sorted(self.root.rglob("log.md")):
             rel_dir = log_path.parent.relative_to(self.root).as_posix()
             rel_dir = "" if rel_dir == "." else rel_dir
-            _, body = split_frontmatter(log_path.read_text(encoding="utf-8-sig"))
+            raw = log_path.read_text(encoding="utf-8-sig")
+            fm, body = split_frontmatter(raw)
+            if fm:
+                # §9 does not define frontmatter for log.md, but the reference
+                # bundle ships some. Keep it verbatim so a re-emit preserves
+                # it rather than synthesizing a different one.
+                pb.log_frontmatter[rel_dir] = raw.split("---", 2)[1].strip("\n")
             current_date = None
             for _, line, in_fence in _iter_nonfence_lines(body):
                 if in_fence:
@@ -594,6 +705,7 @@ class BundleParser:
                     entry = ParsedLogEntry(
                         uid=f"{self.bundle}:log:{order}", date=current_date,
                         kind=kind, text=re.sub(r"\s+", " ", text), order=order,
+                        dir=rel_dir,
                     )
                     targets = [m.group(2) for m in MD_LINK_RE.finditer(text)]
                     # liberal consumer: `path/to/x.md` in backticks counts too
@@ -611,6 +723,28 @@ class BundleParser:
 # --------------------------------------------------------------------------
 # tiny value coercers
 # --------------------------------------------------------------------------
+
+def _has_unclosed_fence(body: str) -> bool:
+    open_marker: Optional[str] = None
+    for line in body.splitlines():
+        m = _FENCE_RE.match(line.lstrip())
+        if not m:
+            continue
+        marker = m.group(1)
+        if open_marker is None:
+            open_marker = marker
+        elif marker[0] == open_marker[0] and len(marker) >= len(open_marker):
+            open_marker = None
+    return open_marker is not None
+
+
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 
 def _strip_fences(text: str) -> str:
     out = []
