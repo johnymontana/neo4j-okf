@@ -341,6 +341,10 @@ def split_sections(body: str) -> list[tuple[str, str, int]]:
 # --------------------------------------------------------------------------
 
 class BundleParser:
+    #: Filenames that are never concepts. Instance-level so producer-specific
+    #: subclasses (e.g. OpenWikiParser) can extend the set without forking.
+    reserved_filenames: frozenset[str] = frozenset(RESERVED_FILENAMES)
+
     def __init__(self, root: str | Path, bundle_name: Optional[str] = None):
         self.root = Path(root).resolve()
         self.bundle = bundle_name or self.root.name
@@ -395,7 +399,7 @@ class BundleParser:
 
         md_files = sorted(
             p for p in self.root.rglob("*.md")
-            if p.name not in RESERVED_FILENAMES
+            if p.name not in self.reserved_filenames
             and not any(part.startswith(".")            # skip .github/, .obsidian/ …
                         for part in p.relative_to(self.root).parts)
         )
@@ -590,7 +594,7 @@ class BundleParser:
             for m in MD_LINK_RE.finditer(clean):
                 text, raw_target = m.group(1), m.group(2)
                 rel = self.resolve_target(raw_target, concept.dir)
-                if rel is None or not rel.endswith(".md") or Path(rel).name in RESERVED_FILENAMES:
+                if rel is None or not rel.endswith(".md") or Path(rel).name in self.reserved_filenames:
                     continue
                 target_id = rel[:-3]
                 target_uid = f"{self.bundle}:{target_id}"

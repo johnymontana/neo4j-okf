@@ -1,0 +1,24 @@
+{
+ "since": "630eb9ec3fa22a4bed2d347fc3ea3a6a3bd22abc",
+ "until": "41f4eac7ad3b68beff9ce891c13973dc73949cdf",
+ "generated_from": "langchain-ai/openwiki",
+ "files": [
+  "openwiki/.last-update.json",
+  "openwiki/architecture/overview.md",
+  "openwiki/quickstart.md"
+ ],
+ "name_status": [
+  [
+   "M",
+   "openwiki/.last-update.json"
+  ],
+  [
+   "M",
+   "openwiki/architecture/overview.md"
+  ],
+  [
+   "M",
+   "openwiki/quickstart.md"
+  ]
+ ]
+}
