@@ -1,7 +1,7 @@
 [project]
 name = "okf-graph"
-version = "0.2.0"
-description = "Ingest Google's Open Knowledge Format (OKF) bundles into Neo4j and query them with GraphRAG"
+version = "0.3.0"
+description = "Google's Open Knowledge Format (OKF) and Neo4j, both directions: ingest bundles, query them with GraphRAG, and project the graph back out as portable OKF"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,11 +9,20 @@ dependencies = [
     "neo4j-graphrag[openai]>=1.18",
     "PyYAML>=6.0",
     "python-dotenv>=1.0",
+    # document + web acquisition (okf_graph.documents)
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
     # demo notebook
     "pandas>=2.0",
     "neo4j-viz>=1.7",
     "jupyterlab>=4.2",
 ]
+
+[project.optional-dependencies]
+# PDFs in a source corpus
+pdf = ["pypdf>=4.0"]
+# `okf-graph wiki --extractor anthropic`
+anthropic = ["anthropic>=0.40"]
 
 [dependency-groups]
 dev = [

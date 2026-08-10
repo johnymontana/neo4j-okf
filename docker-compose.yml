@@ -8,6 +8,11 @@ services:
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-demodemo}
       NEO4J_server_memory_heap_max__size: 2G
+      # APOC is NOT needed by okf_graph's structural ingestion — but the
+      # notebook's SimpleKGPipeline appendix is backed by neo4j-graphrag's
+      # writer/resolver, which call apoc.merge.relationship and
+      # apoc.refactor.mergeNodes. The official image auto-installs it:
+      NEO4J_PLUGINS: '["apoc"]'
     volumes:
       - okf_neo4j_data:/data
     healthcheck:

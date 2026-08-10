@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Gross Margin — Acme Analytics Wiki</title>
+  <meta name="author" content="human:dpark@acme">
+  <meta name="article:modified_time" content="2025-11-04">
+  <meta name="description" content="How the analytics team calculates gross margin.">
+</head>
+<body>
+  <nav id="sidebar">
+    <ul>
+      <li><a href="/wiki/home">Home</a></li>
+      <li><a href="/wiki/metrics">Metrics</a></li>
+      <li><a href="/wiki/warehouse">Warehouse</a></li>
+      <li><a href="/wiki/oncall">On-call</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <h1>Gross Margin</h1>
+
+    <p>Gross margin is the headline profitability number the analytics team reports
+    in the weekly business review. This page is the practical description the team
+    has used since 2023.</p>
+
+    <h2>How we calculate it</h2>
+
+    <p>Gross margin for a period is recognized revenue minus product cost. Product
+    cost comes from the <code>acme.catalog.products</code> table, joined to order
+    lines on <code>product_id</code>.</p>
+
+    <pre><code>gross_margin(period) = revenue(period) - product_cost(period)</code></pre>
+
+    <p>Revenue itself follows the rules described on the Revenue Recognition page.
+    Order-level inputs come from the Customer Orders table in the warehouse.</p>
+
+    <h2>Known caveats</h2>
+
+    <ul>
+      <li>Fulfillment and outbound shipping costs are <em>not</em> included. Several
+      people have asked about this; see the FY2026 Cost Allocation Memo for where
+      Finance landed.</li>
+      <li>Payment processing fees are booked centrally and are not attributed to
+      individual orders here.</li>
+      <li>Marketplace channel orders were backfilled in March 2024; figures before
+      that date understate volume.</li>
+    </ul>
+
+    <h2>Where the number shows up</h2>
+
+    <p>The weekly deck pulls from the Margin Daily dashboard. If the number looks
+    wrong, start with the Margin Drop Triage runbook.</p>
+  </main>
+
+  <footer>
+    <p>Acme Analytics Wiki · edit this page · last reviewed by the analytics guild</p>
+  </footer>
+</body>
+</html>

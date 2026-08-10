@@ -20,7 +20,10 @@ def test_acme_counts(acme):
     assert stats["stub_concepts"] == 0          # every acme link resolves
     assert stats["links"] >= 14
     assert stats["log_entries"] == 4
-    assert stats["artifacts"] == 1              # attesters/sql_equality.py
+    # every non-markdown file, referenced or not: the attester + OKF's own viewer
+    assert stats["artifacts"] == 2
+    assert {a["path"] for a in acme.artifacts.values()} == {
+        "attesters/sql_equality.py", "viz.html"}
 
 
 def test_trust_tiers(acme):
@@ -99,7 +102,7 @@ def test_broken_link_becomes_stub(tmp_path):
 
 def test_fenced_heading_is_not_a_section():
     body = "intro\n\n# Real\n\n```sql\n# not a heading\nSELECT 1;\n```\ntail\n"
-    headings = [h for h, _ in split_sections(body)]
+    headings = [h for h, _, _ in split_sections(body)]
     assert headings == ["_preamble", "Real"]
 
 
