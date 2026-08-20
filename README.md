@@ -98,9 +98,13 @@ Tests: `uv run pytest -q` (the projection tests skip themselves when no Neo4j is
 | `okf_graph/wiki.py` | documents → concept drafts → an OKF bundle. Pluggable extractor: `heuristic` (offline, deterministic), `openai`, `anthropic`. |
 | `okf_graph/queries.py` | governance Cypher (trust tiers, staleness, impact, co-citation) + the `GOVERNED_RETRIEVAL_QUERY` for `VectorCypherRetriever` + Text2Cypher schema/examples. |
 | `okf_graph/embedding.py` | OpenAI embedder factory + deterministic hash embedder for offline rehearsal. |
+| `okf_graph/openwiki.py` | OpenWiki adapter: OKF v0.1 wikis → the same graph, plus groundings, `WikiRun` watermark, impact/staleness/coverage Cypher, wiki retrieval query. |
+| `okf_graph/mcp_server.py` | `okf-graph-mcp` — read-only stdio MCP server (search, change surface, staleness, coverage) over ingested wikis. |
 | `notebooks/okf_graphrag_demo.ipynb` | the live demo: parse → ingest → explore → baseline RAG trap → graph-aware RAG → Text2Cypher → projection → LLM-authored wiki → (appendix) SimpleKGPipeline domain layer. |
-| `tests/` | `uv run pytest -q` — parser semantics, round-trip equivalence, document normalization, fetch-policy refusals, the wiki pipeline, and (Neo4j-gated) projection. |
+| `notebooks/openwiki_neo4j_demo.ipynb` | the OpenWiki demo: ingest OpenWiki's own wiki → page graph → groundings → impact analysis → staleness → GraphRAG → MCP finale. |
+| `tests/` | `uv run pytest -q` — parser semantics, round-trip equivalence, document normalization, fetch-policy refusals, the wiki pipeline, the OpenWiki adapter, and (Neo4j-gated) projection. |
 | `bundles/acme_retail/` | sample OKF v0.2 bundle vendored from [GoogleCloudPlatform/knowledge-catalog](https://github.com/GoogleCloudPlatform/knowledge-catalog) (Apache-2.0) so the demo runs offline. |
+| `bundles/openwiki_self/` | OpenWiki's own dogfooded wiki (OKF v0.1, MIT) + real `git` sidecars (`.git-changes*.json`, `.repo-files.sample.json`) so the OpenWiki demo runs offline. |
 | `corpus/acme_intranet/` | five documents of simulated org exhaust — a wiki page, a finance memo, a warehouse README, a data dictionary, an on-call runbook — in HTML, markdown and plain text. Input for `okf-graph wiki`. |
 | `slides/okf-neo4j.pptx` | the talk deck (diagrams in `slides/diagrams/`). |
 
@@ -260,8 +264,56 @@ known family (`generated.model`, `sources[].license`) are not retained, and
 artifacts over 64 KB or non-UTF-8 are recorded by hash and path rather than
 written.
 
+## OpenWiki wikis, backed by Neo4j
+
+[OpenWiki](https://github.com/langchain-ai/openwiki) (LangChain's agent-written repo wiki) emits
+OKF v0.1 bundles — and computes a page graph, an impact plan, and grounding metadata that it
+**throws away on every run**. The `okf_graph.openwiki` adapter ingests any OpenWiki wiki and
+persists all of it:
+
+```bash
+uv run okf-graph ingest-wiki bundles/openwiki_self --reset --embed --embedding-provider hash
+uv run okf-graph impact --bundle openwiki_self \
+    --changes bundles/openwiki_self/.git-changes.wide.sample.json
+uv run jupyter lab notebooks/openwiki_neo4j_demo.ipynb     # the demo
+```
+
+On top of the standard OKF mapping, the wiki layer adds:
+
+| OpenWiki construct | Graph element |
+|---|---|
+| backticked repo path in prose | `(:Concept)-[:GROUNDED_IN {sections, mentions}]->(:SourceFile {path, kind})` |
+| `openwiki:` frontmatter extension (`source_paths`, `symbols`, `test_paths`, `invariants`) | declared `GROUNDED_IN` edges + `(:Symbol)`, `(:Invariant)`, `[:VALIDATED_BY]` |
+| `.last-update.json` (`gitHead` watermark) | `(:WikiRun {git_head, updated_at, model})-[:PRODUCED]->(:Bundle)` |
+| reserved docs (`index.md`, `INSTRUCTIONS.md`, `_plan.md`, …) | excluded, per OpenWiki's own rules |
+
+That turns `git diff --name-only <gitHead>..HEAD` into a **persistent impact plan** (OpenWiki
+derives one into `_plan.md` per run and deletes it), gives per-page staleness verdicts instead
+of one SHA for the whole wiki, and surfaces coverage gaps and dangling groundings the flat
+files can't see. `bundles/openwiki_self/` vendors OpenWiki's own dogfooded wiki (MIT) with real
+`git` sidecars so everything runs offline.
+
+### The retrieval MCP they never shipped
+
+OpenWiki's eval harness references an `openwiki-retrieval-mcp` that doesn't exist upstream.
+This repo ships it, backed by the graph — read-only tools `wiki_search`, `wiki_get_page`,
+`wiki_change_surface`, `wiki_stale_pages`, `wiki_coverage_gaps`, `wiki_list_bundles`:
+
+```bash
+uv run okf-graph-mcp                      # stdio server (env: OPENWIKI_BUNDLE, OPENWIKI_REPO_ROOT)
+uv run python scripts/smoke_mcp.py        # end-to-end smoke test
+
+# register with Claude Code:
+claude mcp add openwiki-graph -- uv --directory /path/to/neo4j-okf run okf-graph-mcp
+```
+
+Generate a wiki for your own repo and ingest it: `./scripts/generate-wiki.sh /path/to/repo`.
+
 ## Attribution
 
 `bundles/acme_retail` and the OKF specification are from
 [GoogleCloudPlatform/knowledge-catalog](https://github.com/GoogleCloudPlatform/knowledge-catalog), Apache License 2.0.
-This repo is a community demo and is not affiliated with Google.
+`bundles/openwiki_self` is a snapshot of the `openwiki/` wiki in
+[langchain-ai/openwiki](https://github.com/langchain-ai/openwiki), MIT License (upstream commit in
+`.provenance.json`).
+This repo is a community demo and is not affiliated with Google or LangChain.

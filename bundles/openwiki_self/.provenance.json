@@ -1,0 +1,8 @@
+{
+ "upstream": "https://github.com/langchain-ai/openwiki",
+ "commit": "41f4eac7ad3b68beff9ce891c13973dc73949cdf",
+ "path": "openwiki/",
+ "license": "MIT (upstream)",
+ "vendored": "2026-08-09",
+ "note": "Snapshot of OpenWiki's own dogfooded wiki, used as a real OKF v0.1 sample bundle."
+}

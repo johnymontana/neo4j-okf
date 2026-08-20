@@ -12,6 +12,10 @@
     okf-graph fetch docs/ --url https://example.com/handbook --crawl 10
     okf-graph wiki bundles/acme_wiki --path corpus/acme_intranet --ingest
 
+    # OpenWiki wiki (OKF v0.1) -> Neo4j, and the persistent impact plan
+    okf-graph ingest-wiki bundles/openwiki_self --reset --embed
+    okf-graph impact --bundle openwiki_self --repo ../openwiki
+
     okf-graph stats
     okf-graph reset --name acme_retail
 """
@@ -121,10 +125,36 @@ def _add_wiki(sub) -> None:
     p.add_argument("--embedding-provider", default=None, choices=["openai", "hash"])
 
 
+def _add_ingest_wiki(sub) -> None:
+    p = sub.add_parser(
+        "ingest-wiki",
+        help="parse an OpenWiki wiki (openwiki/ or ~/.openwiki/wiki) and write it to Neo4j")
+    p.add_argument("wiki_dir")
+    p.add_argument("--name", default=None, help="bundle name (default: dir name)")
+    p.add_argument("--embed", action="store_true", help="embed sections + create indexes")
+    p.add_argument("--embedding-provider", default=None, choices=["openai", "hash"])
+    p.add_argument("--reset", action="store_true", help="delete this bundle first")
+
+
+def _add_impact(sub) -> None:
+    p = sub.add_parser(
+        "impact",
+        help="changed repo files -> grounded wiki pages (the persistent impact plan)")
+    p.add_argument("--bundle", required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--paths", help="comma-separated changed paths")
+    src.add_argument("--changes",
+                     help="JSON file with {'files': [...]} (see bundles/*/.git-changes.sample.json)")
+    src.add_argument("--repo",
+                     help="documented repo checkout: diff its WikiRun git_head..HEAD")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="okf-graph", description="OKF <-> Neo4j")
     sub = ap.add_subparsers(dest="cmd", required=True)
     _add_ingest(sub)
+    _add_ingest_wiki(sub)
+    _add_impact(sub)
     _add_project(sub)
     _add_fetch(sub)
     _add_wiki(sub)
@@ -163,6 +193,42 @@ def cmd_ingest(writer: GraphWriter, args) -> None:
     print(json.dumps(stats, indent=2))
     if args.embed:
         _embed(writer, args, pb.name)
+
+
+def cmd_ingest_wiki(writer: GraphWriter, args) -> None:
+    from .openwiki import ingest_openwiki, parse_openwiki
+    owb = parse_openwiki(args.wiki_dir, args.name)
+    if args.reset:
+        writer.reset(owb.pb.name)
+    stats = ingest_openwiki(writer, owb)
+    head = owb.run.git_head[:8] if owb.run and owb.run.git_head else "unknown"
+    print(f"ingested OpenWiki bundle '{owb.pb.name}' "
+          f"(okf_version={owb.pb.okf_version}, gitHead={head})")
+    print(json.dumps(stats, indent=2))
+    if args.embed:
+        _embed(writer, args, owb.pb.name)
+
+
+def cmd_impact(writer: GraphWriter, args) -> None:
+    from .openwiki import WIKI_IMPACT_QUERY, git_changed_files, load_changes_json
+    if args.paths:
+        paths = [p.strip() for p in args.paths.split(",") if p.strip()]
+    elif args.changes:
+        paths = load_changes_json(args.changes)["files"]
+    else:
+        rec = writer.run(
+            """MATCH (r:WikiRun)-[:PRODUCED]->(:Bundle {name: $b})
+               RETURN r.git_head AS head ORDER BY r.updated_at DESC LIMIT 1""",
+            b=args.bundle).records
+        if not rec or not rec[0]["head"]:
+            raise SystemExit(f"no WikiRun git_head recorded for bundle {args.bundle!r}")
+        paths = git_changed_files(args.repo, rec[0]["head"])
+    rows = writer.run(WIKI_IMPACT_QUERY, paths=paths, bundle=args.bundle).records
+    print(f"{len(paths)} changed file(s) -> {len(rows)} affected page(s)")
+    for r in rows:
+        down = f"  -> {', '.join(r['downstream_pages'][:4])}" if r["downstream_pages"] else ""
+        print(f"  {r['page']:<38} weight={r['weight']:<4} "
+              f"files={len(r['changed_files'])}{down}")
 
 
 def cmd_project(writer: GraphWriter, args) -> None:
@@ -320,6 +386,10 @@ def main(argv: list[str] | None = None) -> None:
             cmd_wiki(writer_factory, args)
         elif args.cmd == "ingest":
             cmd_ingest(writer_factory(), args)
+        elif args.cmd == "ingest-wiki":
+            cmd_ingest_wiki(writer_factory(), args)
+        elif args.cmd == "impact":
+            cmd_impact(writer_factory(), args)
         elif args.cmd == "project":
             cmd_project(writer_factory(), args)
         elif args.cmd == "stats":
